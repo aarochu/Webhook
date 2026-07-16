@@ -45,7 +45,7 @@ python send_webhook.py --cli
 | **Auto-delete after sending** | Off by default. When on, the message is deleted after it posts. |
 | **after (seconds)** | How long to wait before deleting. 0 (the default) deletes as soon as the send goes through. Max 3600. |
 | **Auto-resend on a loop** | Off by default. When ticked, the **Send message** button becomes an **On/Off** toggle that reposts the current message every cooldown. |
-| **stop after (sends, 0 = unlimited)** | Optional cap. After this many sends the loop turns itself Off. `0` (the default) means no cap — the loop runs until you turn it Off or close the app. |
+| **stop after (sends, 0 = unlimited)** | Optional cap. After this many *successful* posts the loop turns itself Off. A failed fire (e.g. a rate-limit 429) does not count, so the cap always delivers that many landed posts. `0` (the default) means no cap — the loop runs until you turn it Off or close the app. |
 | **Message** | Text to post. |
 
 ### Ping buttons
@@ -107,7 +107,7 @@ Auto-resend reposts the *same* message over and over on a timer, so you don't ha
 
 - Turning it **On** sends immediately, then reposts every **Cooldown** seconds.
 - Editing the **Message** box (or the ping) mid-run changes what the *next* repost sends — the content is re-read each time.
-- Set **stop after** to a number and the loop turns itself **Off** once it reaches that many sends. `0` means unlimited.
+- Set **stop after** to a number and the loop turns itself **Off** once it reaches that many *successful* posts — a failed fire (e.g. a 429) doesn't count against it. `0` means unlimited.
 - Turning it **Off**, or unticking the checkbox, stops the loop and restores the plain **Send message** button.
 
 **CLI.** Answer `y` to *Auto-resend the same message on a loop?* at startup, then optionally set a stop-after count. Type a message and press Enter on a blank line to start the loop; it reposts every cooldown. Typing a new message swaps the content and starts a fresh count. There is no live Off switch in the CLI — press **Ctrl+C** to stop.
@@ -116,7 +116,7 @@ Auto-resend reposts the *same* message over and over on a timer, so you don't ha
 
 **Two limitations worth understanding:**
 
-- **The interval is best-effort against Discord's rate limit.** Discord allows roughly 30 posts per minute per webhook. A 1-second cooldown *will* draw HTTP 429 responses; those are reported in the status line (GUI) or printed (CLI) and then dropped — they are not retried and do not stop the loop. If you want every repost to land, keep the cooldown at a few seconds.
+- **The interval is best-effort against Discord's rate limit.** Discord allows roughly 30 posts per minute per webhook. A 1-second cooldown *will* draw HTTP 429 responses; those are reported in the status line (GUI) or printed (CLI) and then dropped — they are not retried and do not stop the loop. If you want every repost to land, keep the cooldown at a few seconds. Because the **stop after** cap counts only *successful* posts, a webhook that keeps failing (wrong URL, deleted webhook) will keep trying and never hit the cap — turn it Off or close the app to stop it.
 - **The loop lives only in the running app. It stops when you close the app.** Nothing is written to disk and nothing resumes on the next launch — closing the window, a crash, or the machine sleeping ends all resending immediately (and cancels any pending auto-deletes with it). There is no way to schedule a resend for later or across restarts.
 
 ## CLI usage

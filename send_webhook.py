@@ -220,10 +220,14 @@ def resend_step(
     is sent. The send is delegated to send_and_schedule() so auto-delete composes:
     each resent copy carries its own DeleteRequest when auto-delete is on.
 
-    `count` is the number of sends already made before this one. Returns
-    ((ok, detail), delete_request_or_none, keep_going). keep_going is False once
-    max_count has been reached (max_count of 0 means never stop on count). The
-    caller arms the next fire (GUI root.after, CLI daemon thread) while keep_going.
+    `count` is the number of *successful* sends already made before this one.
+    Returns ((ok, detail), delete_request_or_none, keep_going). keep_going is
+    False once max_count successful sends have landed (max_count of 0 means never
+    stop on count). A failed fire does NOT advance toward the cap — only posts
+    that actually land count — so a persistently failing send keeps trying rather
+    than silently exhausting the cap. The caller arms the next fire (GUI
+    root.after, CLI daemon thread) while keep_going, and increments its own count
+    only when ok.
     """
     content = get_content()
     ok, detail, request = send_and_schedule(
@@ -234,9 +238,9 @@ def resend_step(
         settings.auto_delete,
         settings.delay,
     )
-    sent = count + 1
+    successes = count + 1 if ok else count
     max_count = clamp_max_count(settings.max_count)
-    keep_going = not (max_count > 0 and sent >= max_count)
+    keep_going = not (max_count > 0 and successes >= max_count)
     return (ok, detail), request, keep_going
 
 
@@ -524,7 +528,8 @@ def run_gui() -> None:
         (ok, detail), request, keep_going = resend_step(
             lambda: content, settings, resend_state["count"]
         )
-        resend_state["count"] += 1
+        if ok:
+            resend_state["count"] += 1  # only landed posts count toward max-count
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
         if request:
             root.after(request.delay * 1000, lambda: fire_delete(request))
@@ -644,7 +649,8 @@ def _cli_resend_loop(
                 stop_event.wait(0.1)  # batch already drained; idle until new content
                 continue
             (ok, _detail), request, keep_going = resend_step(get_content, settings, count)
-            count += 1
+            if ok:
+                count += 1  # only landed posts count toward max-count
             _print_send_result(ok, _detail, request)
             if not keep_going:
                 mark_done(seen_gen)  # this fire hit max_count — the batch for `gen` is done

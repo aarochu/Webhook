@@ -66,6 +66,36 @@ class ResendCoreTest(unittest.TestCase):
                     )
                     self.assertTrue(keep_going)
 
+    def test_failed_send_does_not_consume_the_cap(self) -> None:
+        """max-count counts *successful* posts: a failed fire must not advance toward N.
+
+        Sequence fail, ok, fail, ok with max_count=2 — only the two successes count,
+        so keep_going stays True through the failures and the first success, and flips
+        False only on the second success (2/2)."""
+        settings = ResendSettings(webhook_url="http://127.0.0.1:0/x", max_count=2)
+        outcomes = iter([
+            (False, "HTTP 429: rate limited", None),
+            (True, "Message sent.", None),
+            (False, "HTTP 429: rate limited", None),
+            (True, "Message sent.", None),
+        ])
+
+        def fake_send_and_schedule(*_a, **_k):
+            return next(outcomes)
+
+        count = 0
+        seen: list[tuple[bool, bool]] = []
+        with mock.patch.object(send_webhook, "send_and_schedule", side_effect=fake_send_and_schedule):
+            for _ in range(4):
+                (ok, _detail), _request, keep_going = send_webhook.resend_step(
+                    lambda: "tick", settings, count
+                )
+                if ok:
+                    count += 1
+                seen.append((ok, keep_going))
+
+        self.assertEqual(seen, [(False, True), (True, True), (False, True), (True, False)])
+
     def test_auto_delete_composes_each_fire(self) -> None:
         """With auto-delete on, every resent copy returns a DeleteRequest for the mock's id."""
         with MockDiscord() as discord:
