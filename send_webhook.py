@@ -181,6 +181,101 @@ def arm_delete_timer(
     return timer
 
 
+class ResendSettings(NamedTuple):
+    """Everything resend_step needs for one send. Content is read separately,
+    at fire time, via a callback so mid-run edits take effect."""
+
+    webhook_url: str
+    username: str | None = None
+    avatar_url: str | None = None
+    auto_delete: bool = False
+    delay: int = MIN_DELAY
+    max_count: int = 0  # 0 (or blank) means unlimited
+
+
+def clamp_max_count(value: object) -> int:
+    """Coerce a max-count to a non-negative integer. Blank/junk/negative -> 0 (unlimited).
+
+    A decimal like "3.5" truncates to 3 rather than silently becoming unlimited — a
+    bounded intent must never invert into an unbounded flood.
+    """
+    try:
+        count = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        try:
+            count = int(float(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0
+    return max(0, count)
+
+
+def resend_step(
+    get_content: Callable[[], str],
+    settings: ResendSettings,
+    count: int,
+) -> tuple[tuple[bool, str], DeleteRequest | None, bool]:
+    """Perform one auto-resend send. Display-free so both front ends share it.
+
+    `get_content` is called now, at fire time, so edits between fires change what
+    is sent. The send is delegated to send_and_schedule() so auto-delete composes:
+    each resent copy carries its own DeleteRequest when auto-delete is on.
+
+    `count` is the number of sends already made before this one. Returns
+    ((ok, detail), delete_request_or_none, keep_going). keep_going is False once
+    max_count has been reached (max_count of 0 means never stop on count). The
+    caller arms the next fire (GUI root.after, CLI daemon thread) while keep_going.
+    """
+    content = get_content()
+    ok, detail, request = send_and_schedule(
+        settings.webhook_url,
+        content,
+        settings.username,
+        settings.avatar_url,
+        settings.auto_delete,
+        settings.delay,
+    )
+    sent = count + 1
+    max_count = clamp_max_count(settings.max_count)
+    keep_going = not (max_count > 0 and sent >= max_count)
+    return (ok, detail), request, keep_going
+
+
+def build_gui_content(message: str, ping_user: bool, user_id: str) -> tuple[str | None, str | None]:
+    """Assemble the message + optional user ping the GUI would send. Display-free.
+
+    Returns (content, error): a ready-to-send string, or (None, reason) when the
+    ping is requested but the user ID isn't numeric. Mirrors the single-send path
+    so a resent copy carries the same mention.
+    """
+    content = message.strip()
+    if ping_user:
+        uid = user_id.strip()
+        if not uid.isdigit():
+            return None, "Paste a numeric Discord user ID, or turn off “Include ping”."
+        mention = f"<@{uid}>"
+        if mention not in content:
+            content = f"{mention} {content}".strip()
+    return content, None
+
+
+def gui_after_fire(keep_going: bool) -> tuple[bool, str]:
+    """Decide what the GUI does after one resend fire. Display-free.
+
+    Returns (loop_still_active, decision): ("continue" -> re-arm the next
+    root.after; "stop" -> max-count reached, flip the toggle back to Off).
+    """
+    if keep_going:
+        return True, "continue"
+    return False, "stop"
+
+
+def resend_button_label(auto_resend_on: bool, loop_active: bool) -> str:
+    """Text for the multi-purpose send button given the checkbox and loop state."""
+    if not auto_resend_on:
+        return "Send message"
+    return "Auto-resend: ON (click to stop)" if loop_active else "Auto-resend: OFF (click to start)"
+
+
 def insert_ping(entry: "tk.Text", kind: str, default_user_id: str = "") -> None:
     """Prompt for an ID and insert a Discord mention into the message box."""
     if kind in ("everyone", "here"):
@@ -287,6 +382,22 @@ def run_gui() -> None:
         wraplength=540,
     ).pack(anchor="w", padx=12)
 
+    ar_row = ttk.Frame(root)
+    ar_row.pack(fill="x", padx=12, pady=6)
+    auto_resend_var = tk.BooleanVar(value=False)
+    ttk.Checkbutton(ar_row, text="Auto-resend on a loop", variable=auto_resend_var).pack(side=tk.LEFT)
+    ttk.Label(ar_row, text="stop after (sends, 0 = unlimited)").pack(side=tk.LEFT, padx=(12, 4))
+    max_count_var = tk.IntVar(value=0)
+    ttk.Spinbox(ar_row, from_=0, to=100000, textvariable=max_count_var, width=8).pack(side=tk.LEFT)
+
+    ttk.Label(
+        root,
+        text="Reposts the current message every cooldown. Turning it On sends now, then repeats. "
+        "Stops at the send cap, when you turn it Off, or when you close the app.",
+        foreground="#666",
+        wraplength=540,
+    ).pack(anchor="w", padx=12)
+
     ttk.Label(root, text="Message").pack(anchor="w", **pad)
     msg = tk.Text(root, height=10, wrap="word", font=("Segoe UI", 10))
     msg.pack(fill="both", expand=True, padx=12, pady=(0, 6))
@@ -311,6 +422,14 @@ def run_gui() -> None:
     send_btn.pack(pady=12)
 
     def tick_cooldown() -> None:
+        if auto_resend_var.get():
+            # The checkbox was ticked mid-cooldown: auto-resend owns the button now,
+            # so drop the single-send cooldown lock instead of clobbering the toggle.
+            send_btn.config(state="normal")
+            refresh_send_button()
+            if status.cget("text").startswith("Wait "):
+                status.config(text="Ready", foreground="#555")
+            return
         remaining = int(cooldown_until["t"] - time.monotonic())
         if remaining > 0:
             send_btn.config(state="disabled", text=f"Cooldown ({remaining}s)")
@@ -325,29 +444,29 @@ def run_gui() -> None:
         ok, detail = delete_message(request.webhook_url, request.message_id)
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
 
+    def read_delay() -> object:
+        try:
+            return delay_var.get()
+        except tk.TclError:
+            return MIN_DELAY
+
+    def read_interval_ms() -> int:
+        try:
+            return max(1, int(cooldown_var.get())) * 1000
+        except (TypeError, ValueError, tk.TclError):
+            return 5000
+
     def on_send() -> None:
         now = time.monotonic()
         if now < cooldown_until["t"]:
             return
 
-        content = msg.get("1.0", "end-1c").strip()
-        uid = user_id_var.get().strip()
-
-        if ping_user_var.get():
-            if not uid.isdigit():
-                messagebox.showerror(
-                    "User ID required",
-                    "Paste a numeric Discord user ID, or turn off “Include ping”.",
-                )
-                return
-            mention = f"<@{uid}>"
-            if mention not in content:
-                content = f"{mention} {content}".strip()
-
-        try:
-            delay_value = delay_var.get()
-        except tk.TclError:
-            delay_value = MIN_DELAY
+        content, err = build_gui_content(
+            msg.get("1.0", "end-1c"), ping_user_var.get(), user_id_var.get()
+        )
+        if err:
+            messagebox.showerror("User ID required", err)
+            return
 
         ok, detail, request = send_and_schedule(
             url_var.get(),
@@ -355,15 +474,11 @@ def run_gui() -> None:
             name_var.get(),
             avatar_var.get(),
             auto_delete_var.get(),
-            delay_value,
+            read_delay(),
         )
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
         if ok:
-            try:
-                seconds = max(1, int(cooldown_var.get()))
-            except (TypeError, ValueError):
-                seconds = 5
-            cooldown_until["t"] = time.monotonic() + seconds
+            cooldown_until["t"] = time.monotonic() + read_interval_ms() / 1000
             tick_cooldown()
             if request:
                 # after() runs the delete on the main loop; a timer thread must
@@ -372,8 +487,197 @@ def run_gui() -> None:
         else:
             messagebox.showerror("Send failed", detail)
 
-    send_btn.config(command=on_send)
+    # --- Auto-resend loop (driven entirely by root.after — no timer thread) ---
+    resend_state = {"active": False, "count": 0, "after_id": None}
+
+    def refresh_send_button() -> None:
+        send_btn.config(text=resend_button_label(auto_resend_var.get(), resend_state["active"]))
+
+    def stop_resend() -> None:
+        if resend_state["after_id"] is not None:
+            root.after_cancel(resend_state["after_id"])
+            resend_state["after_id"] = None
+        resend_state["active"] = False
+        refresh_send_button()
+
+    def fire_resend() -> None:
+        if not resend_state["active"]:
+            return
+        resend_state["after_id"] = None
+
+        content, err = build_gui_content(
+            msg.get("1.0", "end-1c"), ping_user_var.get(), user_id_var.get()
+        )
+        if err:
+            status.config(text=err, foreground="#c42b2b")
+            stop_resend()
+            return
+
+        try:
+            max_count = clamp_max_count(max_count_var.get())
+        except tk.TclError:
+            max_count = 0
+        settings = ResendSettings(
+            url_var.get(), name_var.get(), avatar_var.get(),
+            auto_delete_var.get(), read_delay(), max_count,
+        )
+        (ok, detail), request, keep_going = resend_step(
+            lambda: content, settings, resend_state["count"]
+        )
+        resend_state["count"] += 1
+        status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
+        if request:
+            root.after(request.delay * 1000, lambda: fire_delete(request))
+
+        _active, decision = gui_after_fire(keep_going)
+        if decision == "stop":
+            stop_resend()  # reached max-count — flip the toggle back to Off
+        elif resend_state["active"]:
+            resend_state["after_id"] = root.after(read_interval_ms(), fire_resend)
+
+    def start_resend() -> None:
+        resend_state["active"] = True
+        resend_state["count"] = 0
+        refresh_send_button()
+        fire_resend()  # On fires immediately, then repeats every interval
+
+    def toggle_resend() -> None:
+        if resend_state["active"]:
+            stop_resend()
+        else:
+            start_resend()
+
+    def on_button() -> None:
+        # One button, two jobs: single send when the checkbox is off, On/Off toggle when on.
+        if auto_resend_var.get():
+            toggle_resend()
+        else:
+            on_send()
+
+    def on_auto_resend_toggled() -> None:
+        # Unticking mid-run stops the loop; either way, restore the right button label.
+        if not auto_resend_var.get():
+            stop_resend()
+        else:
+            refresh_send_button()
+
+    auto_resend_var.trace_add("write", lambda *_: on_auto_resend_toggled())
+    send_btn.config(command=on_button)
     root.mainloop()
+
+
+def _apply_mention(content: str, user_id: str) -> str:
+    """Prefix a user mention if a numeric ID was given and it isn't already present."""
+    if user_id.isdigit():
+        mention = f"<@{user_id}>"
+        if mention not in content:
+            return f"{mention} {content}"
+    return content
+
+
+def _read_message(first_prompt: str = "> ", cont_prompt: str = "  ") -> str:
+    """Read a multi-line message; a blank line after content sends it."""
+    lines: list[str] = []
+    while True:
+        line = input(first_prompt if not lines else cont_prompt)
+        if line == "" and lines:
+            break
+        if line == "" and not lines:
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _print_send_result(ok: bool, detail: str, request: DeleteRequest | None) -> None:
+    print(("✓ " if ok else "✗ ") + detail)
+    if request:
+        print(f"  auto-delete in {request.delay}s")
+        arm_delete_timer(
+            request,
+            on_done=lambda deleted, note: print(("  ✓ " if deleted else "  ✗ ") + note),
+        )
+
+
+def _cli_resend_loop(
+    settings: ResendSettings,
+    user_id: str,
+    cooldown: int,
+) -> None:
+    """Repost the current message every `cooldown` seconds on a daemon thread.
+
+    tkinter's thread rule doesn't apply here — the CLI has no widgets — so a
+    background thread is the only way to keep reposting while input() blocks.
+    A lock guards the shared content; a generation counter starts a fresh
+    max-count batch whenever the user types a new message.
+    """
+    # content: str | None; gen: which message the worker should be sending;
+    # done_gen: the highest gen whose bounded batch has fully completed.
+    state = {"content": None, "gen": 0, "done_gen": -1}
+    cond = threading.Condition()  # guards state and signals batch completion
+    stop_event = threading.Event()
+    max_count = settings.max_count
+
+    def get_content() -> str:
+        with cond:
+            return state["content"] or ""
+
+    def mark_done(gen: int) -> None:
+        with cond:
+            if gen > state["done_gen"]:
+                state["done_gen"] = gen
+                cond.notify_all()
+
+    def worker() -> None:
+        seen_gen = -1
+        count = 0
+        while not stop_event.is_set():
+            with cond:
+                content = state["content"]
+                gen = state["gen"]
+            if gen != seen_gen:
+                seen_gen = gen
+                count = 0
+            if content is None:
+                stop_event.wait(0.1)
+                continue
+            if max_count and count >= max_count:
+                stop_event.wait(0.1)  # batch already drained; idle until new content
+                continue
+            (ok, _detail), request, keep_going = resend_step(get_content, settings, count)
+            count += 1
+            _print_send_result(ok, _detail, request)
+            if not keep_going:
+                mark_done(seen_gen)  # this fire hit max_count — the batch for `gen` is done
+            stop_event.wait(cooldown)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        while True:
+            content = _apply_mention(_read_message(), user_id)
+            with cond:
+                state["content"] = content
+                state["gen"] += 1  # fresh max-count batch
+    except EOFError:
+        # Piped/scripted input ended — let the last message's bounded batch finish
+        # what was asked. wait_for returns the instant that gen completes, so the
+        # timeout is only a safety cap (per-send latency included), never the norm.
+        print("\nBye.")
+        if max_count:
+            with cond:
+                target = state["gen"]
+                if state["content"] is not None:
+                    cond.wait_for(
+                        lambda: state["done_gen"] >= target,
+                        timeout=max_count * (cooldown + 16) + 5,
+                    )
+    except KeyboardInterrupt:
+        # Interactive quit — stop immediately, don't drain.
+        print("\nBye.")
+    finally:
+        stop_event.set()
+        thread.join(timeout=5)
+    sys.exit(0)
 
 
 def run_cli() -> None:
@@ -398,28 +702,35 @@ def run_cli() -> None:
             input(f"Delete after how many seconds? [0 = immediately, max {MAX_DELAY}]: ").strip() or "0"
         )
 
+    auto_resend = input("Auto-resend the same message on a loop? [y/N]: ").strip().lower() in ("y", "yes")
+    max_count = 0
+    if auto_resend:
+        max_count = clamp_max_count(
+            input("Stop after how many sends? [blank/0 = unlimited]: ").strip()
+        )
+
     print()
     if auto_delete:
         print(f"Auto-delete ON — {delay}s after each send. Only works while this app is running.")
+
+    if auto_resend:
+        cap = f"until it reaches {max_count} sends" if max_count else "until you press Ctrl+C"
+        print(f"Auto-resend ON — reposts every {cooldown}s {cap}. Stops when you close the app.")
+        print("Type a message + Enter to (re)start the loop with new text. Ctrl+C to quit.")
+        print("-" * 40)
+        settings = ResendSettings(
+            webhook, username, avatar_url, auto_delete, delay, max_count
+        )
+        _cli_resend_loop(settings, user_id, cooldown)
+        return
+
     print("Type your message. Empty line + Enter sends. Ctrl+C to quit.")
     print("-" * 40)
     last_sent = 0.0
 
     while True:
         try:
-            lines: list[str] = []
-            while True:
-                line = input("> " if not lines else "  ")
-                if line == "" and lines:
-                    break
-                if line == "" and not lines:
-                    continue
-                lines.append(line)
-            content = "\n".join(lines)
-            if user_id.isdigit():
-                mention = f"<@{user_id}>"
-                if mention not in content:
-                    content = f"{mention} {content}"
+            content = _apply_mention(_read_message(), user_id)
 
             wait = cooldown - (time.monotonic() - last_sent)
             if wait > 0:
@@ -429,15 +740,9 @@ def run_cli() -> None:
             ok, detail, request = send_and_schedule(
                 webhook, content, username, avatar_url, auto_delete, delay
             )
-            print(("✓ " if ok else "✗ ") + detail)
+            _print_send_result(ok, detail, request)
             if ok:
                 last_sent = time.monotonic()
-            if request:
-                print(f"  auto-delete in {request.delay}s")
-                arm_delete_timer(
-                    request,
-                    on_done=lambda deleted, note: print(("  ✓ " if deleted else "  ✗ ") + note),
-                )
             print()
         except (KeyboardInterrupt, EOFError):
             print("\nBye.")

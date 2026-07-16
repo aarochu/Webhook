@@ -1,0 +1,104 @@
+"""M1 — the display-free resend core: count, max-count stop, live content re-read, delete composition."""
+
+from __future__ import annotations
+
+import unittest
+from unittest import mock
+
+import send_webhook
+from send_webhook import ResendSettings
+from tests.mock_discord import MockDiscord
+
+LOCAL_PREFIXES = ("http://127.0.0.1:",)
+
+
+class ResendCoreTest(unittest.TestCase):
+    def test_k_calls_record_k_posts(self) -> None:
+        with MockDiscord() as discord:
+            settings = ResendSettings(webhook_url=discord.url)
+            with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
+                for count in range(4):
+                    (ok, detail), request, keep_going = send_webhook.resend_step(
+                        lambda: "tick", settings, count
+                    )
+                    self.assertTrue(ok, msg=detail)
+                    self.assertIsNone(request)
+                    self.assertTrue(keep_going, "unlimited resend must never stop on count")
+
+            posts = discord.of("POST")
+            self.assertEqual(len(posts), 4)
+            self.assertTrue(all(p["body"]["content"] == "tick" for p in posts))
+
+    def test_content_is_reread_each_call(self) -> None:
+        """A callback whose return value changes between fires changes the POSTed content."""
+        scripted = iter(["first", "second", "third"])
+        with MockDiscord() as discord:
+            settings = ResendSettings(webhook_url=discord.url)
+            with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
+                for count in range(3):
+                    send_webhook.resend_step(lambda: next(scripted), settings, count)
+
+            bodies = [p["body"]["content"] for p in discord.of("POST")]
+            self.assertEqual(bodies, ["first", "second", "third"])
+
+    def test_max_count_stops_at_n(self) -> None:
+        with MockDiscord() as discord:
+            settings = ResendSettings(webhook_url=discord.url, max_count=3)
+            with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
+                keeps = []
+                for count in range(3):
+                    _result, _request, keep_going = send_webhook.resend_step(
+                        lambda: "tick", settings, count
+                    )
+                    keeps.append(keep_going)
+
+            # Continue after sends 1 and 2; stop once the 3rd (== N) lands.
+            self.assertEqual(keeps, [True, True, False])
+            self.assertEqual(len(discord.of("POST")), 3)
+
+    def test_zero_max_count_is_unlimited(self) -> None:
+        with MockDiscord() as discord:
+            settings = ResendSettings(webhook_url=discord.url, max_count=0)
+            with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
+                for count in range(6):
+                    _result, _request, keep_going = send_webhook.resend_step(
+                        lambda: "tick", settings, count
+                    )
+                    self.assertTrue(keep_going)
+
+    def test_auto_delete_composes_each_fire(self) -> None:
+        """With auto-delete on, every resent copy returns a DeleteRequest for the mock's id."""
+        with MockDiscord() as discord:
+            discord.next_message_id = "909"
+            settings = ResendSettings(
+                webhook_url=discord.url, auto_delete=True, delay=5
+            )
+            with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
+                for count in range(3):
+                    _result, request, _keep = send_webhook.resend_step(
+                        lambda: "tick", settings, count
+                    )
+                    self.assertIsNotNone(request, "auto-delete on must yield a DeleteRequest each fire")
+                    self.assertEqual(request.message_id, "909")
+                    self.assertEqual(request.delay, 5)
+
+
+class ClampMaxCountTest(unittest.TestCase):
+    def test_bounds_and_junk(self) -> None:
+        self.assertEqual(send_webhook.clamp_max_count(3), 3)
+        self.assertEqual(send_webhook.clamp_max_count("3"), 3)
+        self.assertEqual(send_webhook.clamp_max_count(0), 0)
+        self.assertEqual(send_webhook.clamp_max_count(-4), 0)
+        self.assertEqual(send_webhook.clamp_max_count(""), 0)
+        self.assertEqual(send_webhook.clamp_max_count("abc"), 0)
+        self.assertEqual(send_webhook.clamp_max_count(None), 0)
+
+    def test_decimal_truncates_not_flood(self) -> None:
+        """A numeric decimal must stay bounded, not invert into 0 == unlimited."""
+        self.assertEqual(send_webhook.clamp_max_count("3.5"), 3)
+        self.assertEqual(send_webhook.clamp_max_count("2.9"), 2)
+        self.assertEqual(send_webhook.clamp_max_count("-1.5"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
