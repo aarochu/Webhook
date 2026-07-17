@@ -34,7 +34,7 @@ class SmokeTest(unittest.TestCase):
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
                 ok, detail = send_webhook.send_message(discord.url, "   ")[:2]
             self.assertFalse(ok)
-            self.assertIn("empty", detail)
+            self.assertIn("required", detail.lower())
             self.assertEqual(discord.of("POST"), [])
 
 

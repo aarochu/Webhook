@@ -13,14 +13,17 @@ from send_webhook import (
     MAX_DELAY,
     MIN_DELAY,
     DeleteRequest,
+    ImageAttachment,
     ResendSettings,
     arm_delete_timer,
+    attachment_from_bytes,
     build_gui_content,
     clamp_delay,
     clamp_max_count,
     delete_message,
     edit_message,
     forget_sent,
+    format_sent_label,
     gui_after_fire,
     remember_sent,
     resend_step,
@@ -231,6 +234,7 @@ def _note_sent(message_id: str | None, webhook_url: str, content: str) -> None:
 
 
 def _settings() -> ResendSettings:
+    attachment = _current_attachment()
     return ResendSettings(
         webhook_url=st.session_state.get("webhook_url", DEFAULT_WEBHOOK),
         username=st.session_state.get("display_name") or None,
@@ -238,7 +242,16 @@ def _settings() -> ResendSettings:
         auto_delete=st.session_state.get("auto_delete", False),
         delay=clamp_delay(st.session_state.get("delete_delay", MIN_DELAY)),
         max_count=clamp_max_count(st.session_state.get("max_count", 0)),
+        attachment=attachment,
     )
+
+
+def _current_attachment() -> ImageAttachment | None:
+    uploaded = st.session_state.get("image_upload")
+    if uploaded is None:
+        return None
+    attachment, _err = attachment_from_bytes(uploaded.name, uploaded.getvalue(), uploaded.type)
+    return attachment
 
 
 def _cooldown_seconds() -> int:
@@ -263,6 +276,12 @@ def _do_send() -> None:
         st.session_state.status_ok = False
         _log(err, False)
         return
+    attachment = _current_attachment()
+    if not content.strip() and not attachment:
+        st.session_state.status = "Message or image attachment is required."
+        st.session_state.status_ok = False
+        _log(st.session_state.status, False)
+        return
 
     ok, detail, message_id, request = send_and_schedule(
         st.session_state.get("webhook_url", ""),
@@ -271,12 +290,13 @@ def _do_send() -> None:
         st.session_state.get("avatar_url") or None,
         st.session_state.get("auto_delete", False),
         st.session_state.get("delete_delay", MIN_DELAY),
+        attachment,
     )
     st.session_state.status = detail
     st.session_state.status_ok = ok
     _log(detail, ok)
     if ok:
-        _note_sent(message_id, st.session_state.get("webhook_url", ""), content)
+        _note_sent(message_id, st.session_state.get("webhook_url", ""), format_sent_label(content, attachment))
         st.session_state.cooldown_until = time.monotonic() + _cooldown_seconds()
         if request:
             _schedule_delete(request)
@@ -291,6 +311,13 @@ def _do_resend_fire() -> None:
         st.session_state.resend_active = False
         _log(err, False)
         return
+    attachment = _current_attachment()
+    if not content.strip() and not attachment:
+        st.session_state.status = "Message or image attachment is required."
+        st.session_state.status_ok = False
+        st.session_state.resend_active = False
+        _log(st.session_state.status, False)
+        return
 
     settings = _settings()
     (ok, detail), request, keep_going, message_id = resend_step(
@@ -298,7 +325,7 @@ def _do_resend_fire() -> None:
     )
     if ok:
         st.session_state.resend_count += 1
-        _note_sent(message_id, settings.webhook_url, content)
+        _note_sent(message_id, settings.webhook_url, format_sent_label(content, attachment))
     st.session_state.status = detail
     st.session_state.status_ok = ok
     _log(f"[resend #{st.session_state.resend_count}] {detail}", ok)
@@ -379,6 +406,14 @@ with left:
 with right:
     st.markdown('<div class="panel-title">Compose</div>', unsafe_allow_html=True)
     st.text_area("Message", key="message", height=180, placeholder="Transmission payload…")
+    st.file_uploader(
+        "Attach image",
+        type=["png", "jpg", "jpeg", "gif", "webp"],
+        key="image_upload",
+        help="Optional image sent with the message (max 25 MB).",
+    )
+    if st.session_state.get("image_upload") is not None:
+        st.image(st.session_state["image_upload"], caption="Attachment preview", width=220)
 
     st.markdown("**Insert mention**")
     p1, p2, p3, p4 = st.columns(4)

@@ -8,16 +8,18 @@ Cooldown prevents accidental double-sends.
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Callable, NamedTuple
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 except ImportError:
     tk = None
 
@@ -33,6 +35,83 @@ WEBHOOK_PREFIXES = (
 # Auto-delete delay bounds, in seconds. 0 means delete as soon as the send confirms.
 MIN_DELAY = 0
 MAX_DELAY = 3600
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+
+class ImageAttachment(NamedTuple):
+    """A local image file to upload with a webhook message."""
+
+    filename: str
+    data: bytes
+    content_type: str
+
+
+def attachment_from_bytes(
+    filename: str,
+    data: bytes,
+    content_type: str | None = None,
+) -> tuple[ImageAttachment | None, str | None]:
+    ext = Path(filename).suffix.lower()
+    if ext not in IMAGE_EXTENSIONS:
+        return None, "Image must be png, jpg, gif, or webp."
+    if len(data) > MAX_IMAGE_BYTES:
+        return None, "Image must be under 25 MB."
+    ctype = content_type or {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(ext, "application/octet-stream")
+    return ImageAttachment(filename, data, ctype), None
+
+
+def attachment_from_path(path: str) -> tuple[ImageAttachment | None, str | None]:
+    file_path = Path(path)
+    try:
+        data = file_path.read_bytes()
+    except OSError as exc:
+        return None, f"Could not read file: {exc}"
+    return attachment_from_bytes(file_path.name, data)
+
+
+def _build_payload(
+    content: str,
+    username: str | None,
+    avatar_url: str | None,
+) -> tuple[dict | None, str | None]:
+    payload: dict = {
+        "content": content,
+        "allowed_mentions": {"parse": ["users", "roles", "everyone"]},
+    }
+    if username and username.strip():
+        payload["username"] = username.strip()
+    if avatar_url and avatar_url.strip():
+        url = avatar_url.strip()
+        if not url.startswith(("http://", "https://")):
+            return None, "Avatar URL must start with http:// or https://"
+        payload["avatar_url"] = url
+    return payload, None
+
+
+def _encode_multipart(boundary: str, payload: dict, attachment: ImageAttachment) -> bytes:
+    crlf = b"\r\n"
+    body = bytearray()
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(b'Content-Disposition: form-data; name="payload_json"\r\n')
+    body.extend(b"Content-Type: application/json\r\n\r\n")
+    body.extend(json.dumps(payload).encode("utf-8"))
+    body.extend(crlf)
+    body.extend(f"--{boundary}\r\n".encode())
+    body.extend(
+        f'Content-Disposition: form-data; name="files[0]"; filename="{attachment.filename}"\r\n'.encode()
+    )
+    body.extend(f"Content-Type: {attachment.content_type}\r\n\r\n".encode())
+    body.extend(attachment.data)
+    body.extend(crlf)
+    body.extend(f"--{boundary}--\r\n".encode())
+    return bytes(body)
 
 
 def _with_wait(webhook_url: str) -> str:
@@ -46,36 +125,32 @@ def send_message(
     content: str,
     username: str | None = None,
     avatar_url: str | None = None,
+    attachment: ImageAttachment | None = None,
 ) -> tuple[bool, str, str | None]:
     """POST a message to a Discord webhook. Returns (ok, detail, message_id)."""
     webhook_url = webhook_url.strip()
     if not webhook_url.startswith(WEBHOOK_PREFIXES):
         return False, "URL must be a Discord webhook link.", None
 
-    if not content.strip():
-        return False, "Message cannot be empty.", None
+    if not content.strip() and not attachment:
+        return False, "Message or image attachment is required.", None
 
-    payload: dict = {
-        "content": content,
-        "allowed_mentions": {
-            "parse": ["users", "roles", "everyone"],
-        },
-    }
-    if username and username.strip():
-        payload["username"] = username.strip()
-    if avatar_url and avatar_url.strip():
-        url = avatar_url.strip()
-        if not url.startswith(("http://", "https://")):
-            return False, "Avatar URL must start with http:// or https://", None
-        payload["avatar_url"] = url
+    payload, err = _build_payload(content, username, avatar_url)
+    if err:
+        return False, err, None
 
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        _with_wait(webhook_url),
-        data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "WebhookMessenger/1.0"},
-        method="POST",
-    )
+    if attachment:
+        boundary = secrets.token_hex(16)
+        data = _encode_multipart(boundary, payload, attachment)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "WebhookMessenger/1.0",
+        }
+    else:
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", "User-Agent": "WebhookMessenger/1.0"}
+
+    req = urllib.request.Request(_with_wait(webhook_url), data=data, headers=headers, method="POST")
 
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -204,6 +279,13 @@ def update_sent_content(history: list[SentMessage], message_id: str, content: st
     ]
 
 
+def format_sent_label(content: str, attachment: ImageAttachment | None = None) -> str:
+    if attachment:
+        prefix = f"[image: {attachment.filename}]"
+        return f"{prefix} {content}".strip()
+    return content.strip()
+
+
 def send_and_schedule(
     webhook_url: str,
     content: str,
@@ -211,6 +293,7 @@ def send_and_schedule(
     avatar_url: str | None = None,
     auto_delete: bool = False,
     delay: object = MIN_DELAY,
+    attachment: ImageAttachment | None = None,
 ) -> tuple[bool, str, str | None, DeleteRequest | None]:
     """Send, and decide whether a delete should follow.
 
@@ -218,7 +301,9 @@ def send_and_schedule(
     ends share it: the GUI arms the returned request with root.after(), the CLI
     with a daemon threading.Timer.
     """
-    ok, detail, message_id = send_message(webhook_url, content, username, avatar_url)
+    ok, detail, message_id = send_message(
+        webhook_url, content, username, avatar_url, attachment
+    )
     if not ok:
         return ok, detail, None, None
     if not auto_delete:
@@ -261,6 +346,7 @@ class ResendSettings(NamedTuple):
     auto_delete: bool = False
     delay: int = MIN_DELAY
     max_count: int = 0  # 0 (or blank) means unlimited
+    attachment: ImageAttachment | None = None
 
 
 def clamp_max_count(value: object) -> int:
@@ -283,7 +369,7 @@ def resend_step(
     get_content: Callable[[], str],
     settings: ResendSettings,
     count: int,
-) -> tuple[tuple[bool, str], DeleteRequest | None, bool]:
+) -> tuple[tuple[bool, str], DeleteRequest | None, bool, str | None]:
     """Perform one auto-resend send. Display-free so both front ends share it.
 
     `get_content` is called now, at fire time, so edits between fires change what
@@ -307,6 +393,7 @@ def resend_step(
         settings.avatar_url,
         settings.auto_delete,
         settings.delay,
+        settings.attachment,
     )
     successes = count + 1 if ok else count
     max_count = clamp_max_count(settings.max_count)
@@ -515,6 +602,35 @@ def run_gui() -> None:
     msg.pack(fill="x", padx=12, pady=(0, 6))
     msg.insert("1.0", "hey")
 
+    image_state: dict[str, ImageAttachment | None] = {"value": None}
+    img_row = ttk.Frame(body)
+    img_row.pack(fill="x", padx=12, pady=4)
+    image_label = ttk.Label(img_row, text="No image selected", foreground="#666")
+    image_label.pack(side=tk.LEFT, fill="x", expand=True)
+
+    def pick_image() -> None:
+        if filedialog is None:
+            return
+        path = filedialog.askopenfilename(
+            title="Choose an image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.webp")],
+        )
+        if not path:
+            return
+        att, err = attachment_from_path(path)
+        if err:
+            messagebox.showerror("Invalid image", err)
+            return
+        image_state["value"] = att
+        image_label.config(text=att.filename)
+
+    def clear_image() -> None:
+        image_state["value"] = None
+        image_label.config(text="No image selected")
+
+    ttk.Button(img_row, text="Choose image", command=pick_image).pack(side=tk.RIGHT, padx=2)
+    ttk.Button(img_row, text="Clear", command=clear_image).pack(side=tk.RIGHT)
+
     ping_row = ttk.Frame(body)
     ping_row.pack(fill="x", padx=12, pady=4)
     ttk.Label(ping_row, text="Insert ping:").pack(side=tk.LEFT, padx=(0, 8))
@@ -649,6 +765,10 @@ def run_gui() -> None:
         if err:
             messagebox.showerror("User ID required", err)
             return
+        attachment = image_state["value"]
+        if not content.strip() and not attachment:
+            messagebox.showerror("Nothing to send", "Enter a message or attach an image.")
+            return
 
         ok, detail, message_id, request = send_and_schedule(
             url_var.get(),
@@ -657,10 +777,11 @@ def run_gui() -> None:
             avatar_var.get(),
             auto_delete_var.get(),
             read_delay(),
+            attachment,
         )
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
         if ok:
-            note_sent(url_var.get(), message_id, content)
+            note_sent(url_var.get(), message_id, format_sent_label(content, attachment))
             cooldown_until["t"] = time.monotonic() + read_interval_ms() / 1000
             tick_cooldown()
             if request:
@@ -695,6 +816,11 @@ def run_gui() -> None:
             status.config(text=err, foreground="#c42b2b")
             stop_resend()
             return
+        attachment = image_state["value"]
+        if not content.strip() and not attachment:
+            status.config(text="Enter a message or attach an image.", foreground="#c42b2b")
+            stop_resend()
+            return
 
         try:
             max_count = clamp_max_count(max_count_var.get())
@@ -702,14 +828,14 @@ def run_gui() -> None:
             max_count = 0
         settings = ResendSettings(
             url_var.get(), name_var.get(), avatar_var.get(),
-            auto_delete_var.get(), read_delay(), max_count,
+            auto_delete_var.get(), read_delay(), max_count, attachment,
         )
         (ok, detail), request, keep_going, message_id = resend_step(
             lambda: content, settings, resend_state["count"]
         )
         if ok:
             resend_state["count"] += 1  # only landed posts count toward max-count
-            note_sent(settings.webhook_url, message_id, content)
+            note_sent(settings.webhook_url, message_id, format_sent_label(content, attachment))
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
         if request:
             root.after(request.delay * 1000, lambda: fire_delete(request))

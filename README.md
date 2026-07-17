@@ -51,6 +51,7 @@ The Streamlit front end (`streamlit_app.py`) runs in your browser with the same 
 - Auto-resend loop with optional send cap
 - Live status metrics and transmission log
 - **Sent messages** panel — edit or delete posts sent this session
+- **Image upload** — attach a local image to the message (png/jpg/gif/webp)
 
 Open the URL Streamlit prints (usually `http://localhost:8501`). Keep the browser tab open while auto-delete or auto-resend is active — closing it cancels pending timers, same as the desktop app.
 
@@ -72,6 +73,7 @@ Open the URL Streamlit prints (usually `http://localhost:8501`). Keep the browse
 | **Auto-resend on a loop** | Off by default. When ticked, the **Send message** button becomes an **On/Off** toggle that reposts the current message every cooldown. |
 | **stop after (sends, 0 = unlimited)** | Optional cap. After this many *successful* posts the loop turns itself Off. A failed fire (e.g. a rate-limit 429) does not count, so the cap always delivers that many landed posts. `0` (the default) means no cap — the loop runs until you turn it Off or close the app. |
 | **Message** | Text to post. |
+| **Attach image** | Optional local image (png/jpg/gif/webp, max 25 MB). Can be sent with or without text. |
 
 ### Ping buttons
 
