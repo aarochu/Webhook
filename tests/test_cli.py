@@ -24,6 +24,7 @@ def cli_inputs(url: str, auto_delete: str, delay: str = "") -> list:
     ]
     if auto_delete.lower() in ("y", "yes"):
         answers.append(delay)
+    answers.append("n")  # Auto-resend? — off, exercise the single-send path
     answers += [
         "hello from the cli",  # message line
         "",                    # blank line sends
