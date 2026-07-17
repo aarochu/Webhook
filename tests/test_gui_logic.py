@@ -21,7 +21,7 @@ class GuiLogicTest(unittest.TestCase):
         with MockDiscord() as discord:
             discord.next_message_id = "777"
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                ok, detail, request = send_webhook.send_and_schedule(
+                ok, detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True, delay=10
                 )
 
@@ -34,7 +34,7 @@ class GuiLogicTest(unittest.TestCase):
     def test_checkbox_off_yields_nothing_to_schedule(self) -> None:
         with MockDiscord() as discord:
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                _ok, _detail, request = send_webhook.send_and_schedule(
+                _ok, _detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=False, delay=10
                 )
 
@@ -44,10 +44,10 @@ class GuiLogicTest(unittest.TestCase):
         """A hand-typed out-of-range spinbox value must not reach root.after."""
         with MockDiscord() as discord:
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                _ok, _detail, high = send_webhook.send_and_schedule(
+                _ok, _detail, _mid, high = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True, delay=99999
                 )
-                _ok, _detail, low = send_webhook.send_and_schedule(
+                _ok, _detail, _mid2, low = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True, delay=-30
                 )
 
@@ -59,7 +59,7 @@ class GuiLogicTest(unittest.TestCase):
         with MockDiscord() as discord:
             discord.next_message_id = "314159"
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                _ok, _detail, request = send_webhook.send_and_schedule(
+                _ok, _detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True, delay=0
                 )
                 ok, detail = send_webhook.delete_message(request.webhook_url, request.message_id)

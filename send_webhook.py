@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Discord Webhook Messenger
+D4zr + Prototype
 Send one message at a time (with optional user ping) through a Discord webhook.
 Cooldown prevents accidental double-sends.
 """
@@ -120,6 +120,40 @@ def delete_message(webhook_url: str, message_id: str) -> tuple[bool, str]:
         return False, f"Network error: {e.reason}"
 
 
+def edit_message(webhook_url: str, message_id: str, content: str) -> tuple[bool, str]:
+    """PATCH a message this webhook posted. Returns (ok, detail)."""
+    webhook_url = webhook_url.strip()
+    if not webhook_url.startswith(WEBHOOK_PREFIXES):
+        return False, "URL must be a Discord webhook link."
+
+    if not content.strip():
+        return False, "Message cannot be empty."
+
+    payload = json.dumps(
+        {
+            "content": content,
+            "allowed_mentions": {"parse": ["users", "roles", "everyone"]},
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{webhook_url}/messages/{message_id}",
+        data=payload,
+        headers={"Content-Type": "application/json", "User-Agent": "WebhookMessenger/1.0"},
+        method="PATCH",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status in (200, 204):
+                return True, "Message updated."
+            return False, f"Unexpected status: {resp.status}"
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return False, f"HTTP {e.code}: {body}"
+    except urllib.error.URLError as e:
+        return False, f"Network error: {e.reason}"
+
+
 def clamp_delay(value: object) -> int:
     """Coerce a delay to a whole number of seconds inside the allowed bounds."""
     try:
@@ -137,6 +171,39 @@ class DeleteRequest(NamedTuple):
     delay: int
 
 
+class SentMessage(NamedTuple):
+    """A webhook message sent during this app session (for edit/delete UI)."""
+
+    message_id: str
+    webhook_url: str
+    content: str
+    sent_at: str
+
+
+def remember_sent(
+    history: list[SentMessage],
+    message_id: str | None,
+    webhook_url: str,
+    content: str,
+) -> None:
+    """Record a landed message so the UI can edit or delete it later."""
+    if message_id:
+        history.insert(
+            0,
+            SentMessage(message_id, webhook_url.strip(), content, time.strftime("%H:%M:%S")),
+        )
+
+
+def forget_sent(history: list[SentMessage], message_id: str) -> None:
+    history[:] = [m for m in history if m.message_id != message_id]
+
+
+def update_sent_content(history: list[SentMessage], message_id: str, content: str) -> None:
+    history[:] = [
+        m._replace(content=content) if m.message_id == message_id else m for m in history
+    ]
+
+
 def send_and_schedule(
     webhook_url: str,
     content: str,
@@ -144,20 +211,23 @@ def send_and_schedule(
     avatar_url: str | None = None,
     auto_delete: bool = False,
     delay: object = MIN_DELAY,
-) -> tuple[bool, str, DeleteRequest | None]:
+) -> tuple[bool, str, str | None, DeleteRequest | None]:
     """Send, and decide whether a delete should follow.
 
-    Display-free so both front ends share it: the GUI arms the returned request
-    with root.after(), the CLI with a daemon threading.Timer.
+    Returns (ok, detail, message_id, delete_request). Display-free so both front
+    ends share it: the GUI arms the returned request with root.after(), the CLI
+    with a daemon threading.Timer.
     """
     ok, detail, message_id = send_message(webhook_url, content, username, avatar_url)
-    if not ok or not auto_delete:
-        return ok, detail, None
+    if not ok:
+        return ok, detail, None, None
+    if not auto_delete:
+        return ok, detail, message_id, None
 
     if not message_id:
-        return ok, f"{detail} (No message ID returned — cannot auto-delete.)", None
+        return ok, f"{detail} (No message ID returned — cannot auto-delete.)", None, None
 
-    return ok, detail, DeleteRequest(webhook_url.strip(), message_id, clamp_delay(delay))
+    return ok, detail, message_id, DeleteRequest(webhook_url.strip(), message_id, clamp_delay(delay))
 
 
 def arm_delete_timer(
@@ -230,7 +300,7 @@ def resend_step(
     only when ok.
     """
     content = get_content()
-    ok, detail, request = send_and_schedule(
+    ok, detail, message_id, request = send_and_schedule(
         settings.webhook_url,
         content,
         settings.username,
@@ -241,7 +311,7 @@ def resend_step(
     successes = count + 1 if ok else count
     max_count = clamp_max_count(settings.max_count)
     keep_going = not (max_count > 0 and successes >= max_count)
-    return (ok, detail), request, keep_going
+    return (ok, detail), request, keep_going, message_id
 
 
 def build_gui_content(message: str, ping_user: bool, user_id: str) -> tuple[str | None, str | None]:
@@ -327,31 +397,69 @@ def insert_ping(entry: "tk.Text", kind: str, default_user_id: str = "") -> None:
 
 def run_gui() -> None:
     root = tk.Tk()
-    root.title("Discord Webhook Messenger")
-    root.minsize(520, 540)
-    root.geometry("580x600")
+    root.title("D4zr + Prototype")
+    root.minsize(520, 400)
+
+    # Keep send + status visible above the Windows taskbar.
+    footer = ttk.Frame(root)
+    footer.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 12))
+
+    status = ttk.Label(footer, text="Ready", foreground="#555")
+    status.pack(anchor="w", pady=(0, 6))
+
+    send_btn = ttk.Button(footer, text="Send message")
+    send_btn.pack(fill=tk.X)
+
+    canvas_frame = ttk.Frame(root)
+    canvas_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+    canvas = tk.Canvas(canvas_frame, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+    body = ttk.Frame(canvas)
+    canvas_window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+    def _on_body_configure(_event: tk.Event) -> None:
+        canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _on_canvas_configure(event: tk.Event) -> None:
+        canvas.itemconfig(canvas_window, width=event.width)
+
+    def _on_mousewheel(event: tk.Event) -> None:
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    body.bind("<Configure>", _on_body_configure)
+    canvas.bind("<Configure>", _on_canvas_configure)
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    root.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is root else None)
+
+    screen_h = root.winfo_screenheight()
+    win_h = min(640, max(400, screen_h - 100))
+    root.geometry(f"580x{win_h}")
 
     pad = {"padx": 12, "pady": 6}
     cooldown_until = {"t": 0.0}
 
-    ttk.Label(root, text="Webhook URL").pack(anchor="w", **pad)
+    ttk.Label(body, text="Webhook URL").pack(anchor="w", **pad)
     url_var = tk.StringVar(value=DEFAULT_WEBHOOK)
-    ttk.Entry(root, textvariable=url_var).pack(fill="x", padx=12)
+    ttk.Entry(body, textvariable=url_var).pack(fill="x", padx=12)
 
-    ttk.Label(root, text="Display name (optional)").pack(anchor="w", **pad)
+    ttk.Label(body, text="Display name (optional)").pack(anchor="w", **pad)
     name_var = tk.StringVar()
-    ttk.Entry(root, textvariable=name_var).pack(fill="x", padx=12)
+    ttk.Entry(body, textvariable=name_var).pack(fill="x", padx=12)
 
-    ttk.Label(root, text="Profile picture URL (optional)").pack(anchor="w", **pad)
+    ttk.Label(body, text="Profile picture URL (optional)").pack(anchor="w", **pad)
     avatar_var = tk.StringVar()
-    ttk.Entry(root, textvariable=avatar_var).pack(fill="x", padx=12)
+    ttk.Entry(body, textvariable=avatar_var).pack(fill="x", padx=12)
     ttk.Label(
-        root,
+        body,
         text="Direct image link (png/jpg/gif/webp). Hosted online, not a local file.",
         foreground="#666",
     ).pack(anchor="w", padx=12)
 
-    user_row = ttk.Frame(root)
+    user_row = ttk.Frame(body)
     user_row.pack(fill="x", padx=12, pady=6)
     ttk.Label(user_row, text="User ID to ping").pack(side=tk.LEFT)
     user_id_var = tk.StringVar()
@@ -360,18 +468,18 @@ def run_gui() -> None:
     ttk.Checkbutton(user_row, text="Include ping", variable=ping_user_var).pack(side=tk.LEFT)
 
     ttk.Label(
-        root,
+        body,
         text="Numeric ID only (Developer Mode → right-click user → Copy ID)",
         foreground="#666",
     ).pack(anchor="w", padx=12)
 
-    cd_row = ttk.Frame(root)
+    cd_row = ttk.Frame(body)
     cd_row.pack(fill="x", padx=12, pady=6)
     ttk.Label(cd_row, text="Cooldown between sends (seconds)").pack(side=tk.LEFT)
     cooldown_var = tk.IntVar(value=5)
     ttk.Spinbox(cd_row, from_=1, to=3600, textvariable=cooldown_var, width=8).pack(side=tk.LEFT, padx=8)
 
-    ad_row = ttk.Frame(root)
+    ad_row = ttk.Frame(body)
     ad_row.pack(fill="x", padx=12, pady=6)
     auto_delete_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(ad_row, text="Auto-delete after sending", variable=auto_delete_var).pack(side=tk.LEFT)
@@ -380,13 +488,13 @@ def run_gui() -> None:
     ttk.Spinbox(ad_row, from_=MIN_DELAY, to=MAX_DELAY, textvariable=delay_var, width=8).pack(side=tk.LEFT)
 
     ttk.Label(
-        root,
+        body,
         text="0 = delete immediately. Only works while this app is running — closing it cancels pending deletes.",
         foreground="#666",
         wraplength=540,
     ).pack(anchor="w", padx=12)
 
-    ar_row = ttk.Frame(root)
+    ar_row = ttk.Frame(body)
     ar_row.pack(fill="x", padx=12, pady=6)
     auto_resend_var = tk.BooleanVar(value=False)
     ttk.Checkbutton(ar_row, text="Auto-resend on a loop", variable=auto_resend_var).pack(side=tk.LEFT)
@@ -395,19 +503,19 @@ def run_gui() -> None:
     ttk.Spinbox(ar_row, from_=0, to=100000, textvariable=max_count_var, width=8).pack(side=tk.LEFT)
 
     ttk.Label(
-        root,
+        body,
         text="Reposts the current message every cooldown. Turning it On sends now, then repeats. "
         "Stops at the send cap, when you turn it Off, or when you close the app.",
         foreground="#666",
         wraplength=540,
     ).pack(anchor="w", padx=12)
 
-    ttk.Label(root, text="Message").pack(anchor="w", **pad)
-    msg = tk.Text(root, height=10, wrap="word", font=("Segoe UI", 10))
-    msg.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+    ttk.Label(body, text="Message").pack(anchor="w", **pad)
+    msg = tk.Text(body, height=6, wrap="word", font=("Segoe UI", 10))
+    msg.pack(fill="x", padx=12, pady=(0, 6))
     msg.insert("1.0", "hey")
 
-    ping_row = ttk.Frame(root)
+    ping_row = ttk.Frame(body)
     ping_row.pack(fill="x", padx=12, pady=4)
     ttk.Label(ping_row, text="Insert ping:").pack(side=tk.LEFT, padx=(0, 8))
     ttk.Button(
@@ -419,11 +527,78 @@ def run_gui() -> None:
     )
     ttk.Button(ping_row, text="@here", command=lambda: insert_ping(msg, "here")).pack(side=tk.LEFT, padx=2)
 
-    status = ttk.Label(root, text="Ready", foreground="#555")
-    status.pack(anchor="w", padx=12, pady=(4, 0))
+    sent_messages: list[SentMessage] = []
+    history_box = ttk.LabelFrame(body, text="Sent messages (this session)")
+    history_box.pack(fill="x", padx=12, pady=(8, 4))
+    history_list = ttk.Frame(history_box)
+    history_list.pack(fill="x", padx=8, pady=6)
+    ttk.Label(
+        history_box,
+        text="Only messages sent through this app appear here. Webhooks cannot read channel history.",
+        foreground="#666",
+        wraplength=520,
+    ).pack(anchor="w", padx=8, pady=(0, 6))
 
-    send_btn = ttk.Button(root, text="Send message")
-    send_btn.pack(pady=12)
+    def refresh_history() -> None:
+        for child in history_list.winfo_children():
+            child.destroy()
+        if not sent_messages:
+            ttk.Label(history_list, text="No messages yet.", foreground="#666").pack(anchor="w")
+            return
+        for rec in sent_messages[:20]:
+            row = ttk.Frame(history_list)
+            row.pack(fill="x", pady=2)
+            preview = rec.content if len(rec.content) <= 72 else rec.content[:72] + "…"
+            ttk.Label(row, text=f"[{rec.sent_at}] {preview}", wraplength=360).pack(
+                side=tk.LEFT, fill="x", expand=True
+            )
+
+            def open_edit(message_id: str = rec.message_id, webhook: str = rec.webhook_url, text: str = rec.content) -> None:
+                dialog = tk.Toplevel(root)
+                dialog.title("Edit message")
+                dialog.resizable(True, False)
+                dialog.grab_set()
+                ttk.Label(dialog, text="New content:").pack(anchor="w", padx=12, pady=(12, 4))
+                edit_box = tk.Text(dialog, height=5, width=48, wrap="word", font=("Segoe UI", 10))
+                edit_box.pack(padx=12, pady=4)
+                edit_box.insert("1.0", text)
+
+                def save() -> None:
+                    new_text = edit_box.get("1.0", "end-1c").strip()
+                    if not new_text:
+                        messagebox.showerror("Empty message", "Message cannot be empty.", parent=dialog)
+                        return
+                    ok, detail = edit_message(webhook, message_id, new_text)
+                    status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
+                    if ok:
+                        update_sent_content(sent_messages, message_id, new_text)
+                        refresh_history()
+                        dialog.destroy()
+                    else:
+                        messagebox.showerror("Edit failed", detail, parent=dialog)
+
+                btn_row = ttk.Frame(dialog)
+                btn_row.pack(padx=12, pady=(0, 12))
+                ttk.Button(btn_row, text="Save", command=save).pack(side=tk.LEFT, padx=4)
+                ttk.Button(btn_row, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=4)
+
+            def do_delete(message_id: str = rec.message_id, webhook: str = rec.webhook_url) -> None:
+                ok, detail = delete_message(webhook, message_id)
+                status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
+                if ok:
+                    forget_sent(sent_messages, message_id)
+                    refresh_history()
+                else:
+                    messagebox.showerror("Delete failed", detail)
+
+            ttk.Button(row, text="Edit", width=6, command=open_edit).pack(side=tk.RIGHT, padx=2)
+            ttk.Button(row, text="Delete", width=7, command=do_delete).pack(side=tk.RIGHT)
+
+    refresh_history()
+
+    def note_sent(webhook: str, message_id: str | None, content: str) -> None:
+        remember_sent(sent_messages, message_id, webhook, content)
+        refresh_history()
 
     def tick_cooldown() -> None:
         if auto_resend_var.get():
@@ -447,6 +622,9 @@ def run_gui() -> None:
     def fire_delete(request: DeleteRequest) -> None:
         ok, detail = delete_message(request.webhook_url, request.message_id)
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
+        if ok:
+            forget_sent(sent_messages, request.message_id)
+            refresh_history()
 
     def read_delay() -> object:
         try:
@@ -472,7 +650,7 @@ def run_gui() -> None:
             messagebox.showerror("User ID required", err)
             return
 
-        ok, detail, request = send_and_schedule(
+        ok, detail, message_id, request = send_and_schedule(
             url_var.get(),
             content,
             name_var.get(),
@@ -482,6 +660,7 @@ def run_gui() -> None:
         )
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
         if ok:
+            note_sent(url_var.get(), message_id, content)
             cooldown_until["t"] = time.monotonic() + read_interval_ms() / 1000
             tick_cooldown()
             if request:
@@ -525,11 +704,12 @@ def run_gui() -> None:
             url_var.get(), name_var.get(), avatar_var.get(),
             auto_delete_var.get(), read_delay(), max_count,
         )
-        (ok, detail), request, keep_going = resend_step(
+        (ok, detail), request, keep_going, message_id = resend_step(
             lambda: content, settings, resend_state["count"]
         )
         if ok:
             resend_state["count"] += 1  # only landed posts count toward max-count
+            note_sent(settings.webhook_url, message_id, content)
         status.config(text=detail, foreground="#1a7f37" if ok else "#c42b2b")
         if request:
             root.after(request.delay * 1000, lambda: fire_delete(request))
@@ -648,7 +828,7 @@ def _cli_resend_loop(
             if max_count and count >= max_count:
                 stop_event.wait(0.1)  # batch already drained; idle until new content
                 continue
-            (ok, _detail), request, keep_going = resend_step(get_content, settings, count)
+            (ok, _detail), request, keep_going, _message_id = resend_step(get_content, settings, count)
             if ok:
                 count += 1  # only landed posts count toward max-count
             _print_send_result(ok, _detail, request)
@@ -687,7 +867,7 @@ def _cli_resend_loop(
 
 
 def run_cli() -> None:
-    print("Discord Webhook Messenger")
+    print("D4zr + Prototype")
     print("-" * 40)
     webhook = input("Webhook URL: ").strip() or DEFAULT_WEBHOOK
     if not webhook:
@@ -743,7 +923,7 @@ def run_cli() -> None:
                 print(f"Cooldown: wait {int(wait) + 1}s…")
                 time.sleep(wait)
 
-            ok, detail, request = send_and_schedule(
+            ok, detail, _message_id, request = send_and_schedule(
                 webhook, content, username, avatar_url, auto_delete, delay
             )
             _print_send_result(ok, detail, request)

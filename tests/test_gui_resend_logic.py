@@ -35,7 +35,7 @@ class GuiAfterFireTest(unittest.TestCase):
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
                 decisions = []
                 for count in range(2):
-                    _result, _request, keep_going = send_webhook.resend_step(
+                    _result, _request, keep_going, _message_id = send_webhook.resend_step(
                         lambda: "tick", settings, count
                     )
                     decisions.append(send_webhook.gui_after_fire(keep_going)[1])

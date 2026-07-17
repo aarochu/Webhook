@@ -1,8 +1,8 @@
-# Discord Webhook Messenger
+# D4zr + Prototype
 
 A small Python app that posts messages to a Discord channel webhook. You can set a display name, optional profile picture, ping users or roles, enforce a cooldown between sends, auto-delete a message after it posts, and auto-resend a message on a loop.
 
-Requires Python 3.10+. Uses only the standard library (no pip install).
+Requires Python 3.10+. The tkinter GUI and CLI use only the standard library. The Streamlit UI needs `pip install -r requirements.txt`.
 
 ---
 
@@ -19,7 +19,14 @@ If a webhook URL was ever shared or committed, delete it in Discord and create a
 
 ## Run the app
 
-**GUI (default)**
+**Streamlit UI (browser, futuristic theme)**
+
+```
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+**Tkinter GUI (desktop)**
 
 ```
 python send_webhook.py
@@ -33,7 +40,25 @@ python send_webhook.py --cli
 
 ---
 
-## GUI fields
+## Streamlit UI
+
+The Streamlit front end (`streamlit_app.py`) runs in your browser with the same core features as the desktop GUI:
+
+- Webhook URL, display name, profile picture
+- User ping with optional mention
+- Cooldown between sends
+- Auto-delete after sending
+- Auto-resend loop with optional send cap
+- Live status metrics and transmission log
+- **Sent messages** panel — edit or delete posts sent this session
+
+Open the URL Streamlit prints (usually `http://localhost:8501`). Keep the browser tab open while auto-delete or auto-resend is active — closing it cancels pending timers, same as the desktop app.
+
+**Note:** Webhooks cannot read channel history. The sent-messages panel only lists messages posted through this app during the current session.
+
+---
+
+## GUI fields (tkinter)
 
 | Field | What it does |
 |--------|----------------|

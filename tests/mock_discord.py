@@ -60,6 +60,18 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._respond(204)
 
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8") if length else None
+        self._record("PATCH", parsed, body)
+
+        if self.server.patch_status >= 400:
+            self._respond(self.server.patch_status, {"message": "mock patch failure"})
+            return
+        content = body and json.loads(body).get("content")
+        self._respond(200, {"id": parsed.path.rsplit("/", 1)[-1], "content": content})
+
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
         self._record("DELETE", parsed)
@@ -79,6 +91,7 @@ class MockDiscord:
         self.server.next_message_id = DEFAULT_MESSAGE_ID
         self.server.post_status = 200
         self.server.delete_status = 204
+        self.server.patch_status = 200
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self) -> "MockDiscord":

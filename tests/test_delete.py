@@ -52,7 +52,7 @@ class SendAndScheduleTest(unittest.TestCase):
         with MockDiscord() as discord:
             discord.next_message_id = "42"
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                ok, detail, request = send_webhook.send_and_schedule(
+                ok, detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True, delay=7
                 )
 
@@ -64,7 +64,7 @@ class SendAndScheduleTest(unittest.TestCase):
     def test_no_request_when_auto_delete_off(self) -> None:
         with MockDiscord() as discord:
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                ok, detail, request = send_webhook.send_and_schedule(
+                ok, detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=False
                 )
 
@@ -75,7 +75,7 @@ class SendAndScheduleTest(unittest.TestCase):
         with MockDiscord() as discord:
             discord.server.post_status = 500
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                ok, _detail, request = send_webhook.send_and_schedule(
+                ok, _detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True
                 )
 
@@ -88,7 +88,7 @@ class ScheduledDeleteTest(unittest.TestCase):
     def test_delete_fires_after_delay(self) -> None:
         with MockDiscord() as discord:
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                _ok, _detail, request = send_webhook.send_and_schedule(
+                _ok, _detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "self destructing", auto_delete=True, delay=1
                 )
                 self.assertIsNotNone(request)
@@ -104,7 +104,7 @@ class ScheduledDeleteTest(unittest.TestCase):
     def test_zero_delay_fires_promptly(self) -> None:
         with MockDiscord() as discord:
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                _ok, _detail, request = send_webhook.send_and_schedule(
+                _ok, _detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "gone instantly", auto_delete=True, delay=0
                 )
                 started = time.monotonic()
@@ -119,7 +119,7 @@ class ScheduledDeleteTest(unittest.TestCase):
             discord.delete_status = 404
             seen: list[tuple[bool, str]] = []
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
-                _ok, _detail, request = send_webhook.send_and_schedule(
+                _ok, _detail, _message_id, request = send_webhook.send_and_schedule(
                     discord.url, "hi", auto_delete=True, delay=0
                 )
                 send_webhook.arm_delete_timer(request, on_done=lambda ok, d: seen.append((ok, d)))
