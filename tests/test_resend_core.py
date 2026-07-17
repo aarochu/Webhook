@@ -18,7 +18,7 @@ class ResendCoreTest(unittest.TestCase):
             settings = ResendSettings(webhook_url=discord.url)
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
                 for count in range(4):
-                    (ok, detail), request, keep_going = send_webhook.resend_step(
+                    (ok, detail), request, keep_going, _message_id = send_webhook.resend_step(
                         lambda: "tick", settings, count
                     )
                     self.assertTrue(ok, msg=detail)
@@ -47,7 +47,7 @@ class ResendCoreTest(unittest.TestCase):
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
                 keeps = []
                 for count in range(3):
-                    _result, _request, keep_going = send_webhook.resend_step(
+                    _result, _request, keep_going, _message_id = send_webhook.resend_step(
                         lambda: "tick", settings, count
                     )
                     keeps.append(keep_going)
@@ -61,7 +61,7 @@ class ResendCoreTest(unittest.TestCase):
             settings = ResendSettings(webhook_url=discord.url, max_count=0)
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
                 for count in range(6):
-                    _result, _request, keep_going = send_webhook.resend_step(
+                    _result, _request, keep_going, _message_id = send_webhook.resend_step(
                         lambda: "tick", settings, count
                     )
                     self.assertTrue(keep_going)
@@ -74,10 +74,10 @@ class ResendCoreTest(unittest.TestCase):
         False only on the second success (2/2)."""
         settings = ResendSettings(webhook_url="http://127.0.0.1:0/x", max_count=2)
         outcomes = iter([
-            (False, "HTTP 429: rate limited", None),
-            (True, "Message sent.", None),
-            (False, "HTTP 429: rate limited", None),
-            (True, "Message sent.", None),
+            (False, "HTTP 429: rate limited", None, None),
+            (True, "Message sent.", "1", None),
+            (False, "HTTP 429: rate limited", None, None),
+            (True, "Message sent.", "2", None),
         ])
 
         def fake_send_and_schedule(*_a, **_k):
@@ -87,7 +87,7 @@ class ResendCoreTest(unittest.TestCase):
         seen: list[tuple[bool, bool]] = []
         with mock.patch.object(send_webhook, "send_and_schedule", side_effect=fake_send_and_schedule):
             for _ in range(4):
-                (ok, _detail), _request, keep_going = send_webhook.resend_step(
+                (ok, _detail), _request, keep_going, _message_id = send_webhook.resend_step(
                     lambda: "tick", settings, count
                 )
                 if ok:
@@ -105,7 +105,7 @@ class ResendCoreTest(unittest.TestCase):
             )
             with mock.patch.object(send_webhook, "WEBHOOK_PREFIXES", LOCAL_PREFIXES):
                 for count in range(3):
-                    _result, request, _keep = send_webhook.resend_step(
+                    _result, request, _keep, _message_id = send_webhook.resend_step(
                         lambda: "tick", settings, count
                     )
                     self.assertIsNotNone(request, "auto-delete on must yield a DeleteRequest each fire")

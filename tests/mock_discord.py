@@ -11,6 +11,7 @@ Stdlib only, no outbound network.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -24,15 +25,39 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         """Silence stderr logging during tests."""
 
-    def _record(self, method: str, parsed, body: str | None = None) -> None:
-        self.server.requests.append(
-            {
-                "method": method,
-                "path": parsed.path,
-                "query": parse_qs(parsed.query),
-                "body": json.loads(body) if body else None,
-            }
-        )
+    def _record(self, method: str, parsed, body: str | bytes | None = None, *, multipart: bool = False) -> None:
+        entry: dict = {
+            "method": method,
+            "path": parsed.path,
+            "query": parse_qs(parsed.query),
+        }
+        if multipart and isinstance(body, dict):
+            entry["multipart"] = True
+            entry["payload"] = body.get("payload")
+            entry["filename"] = body.get("filename")
+        else:
+            entry["body"] = json.loads(body) if body else None
+        self.server.requests.append(entry)
+
+    def _parse_multipart(self, body: bytes, content_type: str) -> dict:
+        match = re.search(r"boundary=(.+)", content_type)
+        if not match:
+            return {}
+        boundary = match.group(1).strip().strip('"')
+        parts = body.split(f"--{boundary}".encode())
+        payload = None
+        filename = None
+        for part in parts:
+            if b"name=\"payload_json\"" in part:
+                chunks = part.split(b"\r\n\r\n", 1)
+                if len(chunks) == 2:
+                    payload = json.loads(chunks[1].rstrip(b"\r\n"))
+            if b"filename=" in part:
+                header = part.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="replace")
+                name_match = re.search(r'filename="([^"]+)"', header)
+                if name_match:
+                    filename = name_match.group(1)
+        return {"payload": payload, "filename": filename}
 
     def _respond(self, status: int, payload: dict | None = None) -> None:
         data = json.dumps(payload).encode("utf-8") if payload is not None else b""
@@ -47,8 +72,17 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length).decode("utf-8") if length else None
-        self._record("POST", parsed, body)
+        raw = self.rfile.read(length) if length else b""
+        content_type = self.headers.get("Content-Type", "")
+
+        if content_type.startswith("multipart/form-data"):
+            parsed_body = self._parse_multipart(raw, content_type)
+            self._record("POST", parsed, parsed_body, multipart=True)
+            content = (parsed_body.get("payload") or {}).get("content")
+        else:
+            body = raw.decode("utf-8") if raw else None
+            self._record("POST", parsed, body)
+            content = body and json.loads(body).get("content")
 
         if self.server.post_status >= 400:
             self._respond(self.server.post_status, {"message": "mock post failure"})
@@ -56,9 +90,21 @@ class _Handler(BaseHTTPRequestHandler):
 
         # Discord only returns the created message (and its id) when wait=true.
         if parse_qs(parsed.query).get("wait") == ["true"]:
-            self._respond(200, {"id": self.server.next_message_id, "content": (body and json.loads(body).get("content"))})
+            self._respond(200, {"id": self.server.next_message_id, "content": content})
         else:
             self._respond(204)
+
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length).decode("utf-8") if length else None
+        self._record("PATCH", parsed, body)
+
+        if self.server.patch_status >= 400:
+            self._respond(self.server.patch_status, {"message": "mock patch failure"})
+            return
+        content = body and json.loads(body).get("content")
+        self._respond(200, {"id": parsed.path.rsplit("/", 1)[-1], "content": content})
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
@@ -79,6 +125,7 @@ class MockDiscord:
         self.server.next_message_id = DEFAULT_MESSAGE_ID
         self.server.post_status = 200
         self.server.delete_status = 204
+        self.server.patch_status = 200
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def __enter__(self) -> "MockDiscord":
